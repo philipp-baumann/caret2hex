@@ -279,6 +279,24 @@ paste_plusminus <- function(.data, ..., digits = NULL, .digit_lag = 1) {
 # Modified from:
 # https://topepo.github.io/rsample/articles/Applications/Nested_Resampling.html
 
+rules_per_committee_splits <- function(cubist) {
+  splits <- cubist[["splits"]]
+  splits %>%
+    dplyr::group_by(committee) %>%
+    dplyr::summarize(n_rules = dplyr::n_distinct(rule)) %>%
+    dplyr::pull(n_rules)
+}
+
+rules_per_committee <- function(model) {
+  cubist_call <- rlang::set_names(capture.output(model))
+  rules_match <- stringr::str_match(cubist_call, "rules") %>% as.vector() %>%
+    is.na() %>% magrittr::not()
+  rules_chr <- cubist_call[rules_match]
+  rules_chr_split <- stringr::str_split(rules_chr, ",") %>% unlist()
+  rules <- map_int(rules_chr_split, ~ as.integer(stringr::str_extract(.x, "\\d")))
+  rules
+}
+
 # Fit a model to an `rsplit` object using a Cubist parameter set
 # and predict on hold out using inner or outer resampling hold-outs ------------
 
@@ -288,12 +306,12 @@ cubist_rmse <- function(object, committees = 5, neighbors = 2,
                         x_var, y_var,
                         keep_predictions = FALSE) {
   
-  data_analysis <- rsample::analysis(object)
+  data_analysis <- rsample::analysis(object) %>% na.omit()
   y_values <- data_analysis[[y_var]]
   X_values <- data.table::rbindlist(data_analysis[[x_var]])
   mod <- Cubist::cubist(x = X_values, y = y_values,
     committees = committees, neighbors = neighbors)
-  data_assessment <- rsample::assessment(object)
+  data_assessment <- rsample::assessment(object) %>% na.omit()
   y_assessment <- data_assessment[[y_var]]
   X_assessment <- data.table::rbindlist(data_assessment[[x_var]])
   holdout_pred <- predict(object = mod, newdata = X_assessment,
@@ -303,6 +321,7 @@ cubist_rmse <- function(object, committees = 5, neighbors = 2,
   if (!keep_predictions) {rmse} else {
     tibble::tibble(
       RMSE = rmse,
+      rules = list(rules_per_committee(mod)), # rules_per_committee
       predobs = list(tibble::tibble(pred = holdout_pred, obs = y_assessment))
     )
   }
@@ -613,9 +632,8 @@ rename_predobs_y_var <- function(object, y_var) {
   # use ensym() instead of enquo() to caputure the y_var argument
   # supplied by the user; enymb check the captured expression is a string or
   # a symbol, and will return a symbol in both cases
-  # var <- enquo(y_var)
   quo_var <- rlang::ensym(y_var)
-  new_names <- paste0(quo_name(quo_var), c("_pred", "_obs"))
+  new_names <- paste0(rlang::quo_name(quo_var), c("_pred", "_obs"))
   vars <- c("pred", "obs")
   names(vars) <- new_names
 
@@ -640,4 +658,111 @@ join_predobs_y_vars <- function(..., object) {
   # // pb: 20180711: Remove `by = "resample_id"` argument because 
   # there may be other common character or factor variables to join by
   purrr::reduce(dfs_unnested, function(x, y) dplyr::inner_join(x = x, y = y))
+}
+
+# Summarize Cubist parameter tuning and rules (majority cases) across resamples 
+summarize_outer_tuning <- function(data) {
+  
+  data_bound <- dplyr::bind_rows(data)
+  
+  summary_committees <- data_bound %>%
+    dplyr::select(y_var, committees) %>%
+    dplyr::group_by(y_var) %>%
+    dplyr::count(committees) %>%
+    dplyr::rename(n_committees = n) %>%
+    dplyr::mutate(committees_count =
+      paste0(committees, "(", n_committees, ")")) %>% 
+    dplyr::arrange(desc(n_committees)) %>%
+    select(y_var, committees_count)
+  
+  summary_neighbors <- data_bound %>%
+    dplyr::select(y_var, neighbors) %>%
+    dplyr::group_by(y_var) %>%
+    dplyr::count(neighbors) %>%
+    dplyr::rename(n_neighbors = n) %>%
+    dplyr::mutate(neighbors_count = 
+      paste0(neighbors, "(", n_neighbors, ")")) %>% 
+    dplyr::arrange(desc(n_neighbors)) %>%
+    dplyr::select(y_var, neighbors_count)
+  
+  committees_count_chr <- paste(summary_committees$committees_count,
+    sep = "; ", collapse = "; ")
+  neighbors_count_chr <- paste(summary_neighbors$neighbors_count,
+    sep = "; ", collapse = "; ")
+  
+  rules_all <- unlist(data_bound$rules)
+  rules_ranked <- sort(table(rules_all), decreasing = TRUE)
+  rules_majority_chr <- names(rules_ranked[1])
+  
+  tibble::tibble(
+    variable = unique(data_bound$y_var),
+    committees = committees_count_chr,
+    neighbors = neighbors_count_chr,
+    rules = rules_majority_chr
+  )
+}
+
+# Custom rsample nested resampling assessment indices conversion to
+# caret `trainControl` `index` interface
+rsample2caret_nested <- function(object, data = "analysis") {
+  data <- match.arg(data)
+  in_ind <- purrr::map(object$splits, as.integer, data = "analysis")
+  names(in_ind) <- paste0("Fold", sprintf("%02d", 1L:nrow(object)))
+  in_ind
+}
+
+add_repeat <- function(lst,
+                       repeat_colname = Repeat,
+                       repeat_string = "Repeat") {
+  repeat_colnm <- rlang::enquo(repeat_colname)
+  purrr::imap(lst, 
+    ~ dplyr::mutate(.x, !!repeat_colnm := paste0(repeat_string, .y))
+  )
+}
+
+# Adapt fold `in` indices because there is a shift of - 1 starting from
+shift_fold_idx <- function(x, idx_from) {
+  purrr::map(.x = x,
+    ~ {.x[.x > idx_from] <- .x[.x > idx_from] - 1L; .x})
+}
+
+summarize_outer_tuning_vars <- function(data) {
+  col_syms <- rlang::syms(names(data))
+  vars_chr <- purrr::map_chr(col_syms, rlang::quo_name)
+  
+  purrr::map_at(
+    .x = data, 
+    .at = vars_chr,
+    .f = ~ summarize_outer_tuning(data = .x)) %>%
+    dplyr::bind_rows()
+}
+
+
+# Extract # of committees, neighbors and rules ---------------------------------
+
+cubist_tuning_params <- function(model, method = "A") {
+  rules_all <- rules_per_committee(model$finalModel)
+  awc_rules_ranked <- sort(table(rules_all), decreasing = TRUE)
+  rule <- names(awc_rules_ranked)[1]
+  
+  best_tune <- model$bestTune
+  
+  tibble::tibble(
+    method = method,
+    committees = best_tune$committees,
+    neighbors = best_tune$neighbors,
+    rules = rule)
+}
+
+freq_highest <- function(x) {
+  ranked <- sort(table(x), decreasing = TRUE)
+  names(ranked)[1]
+}
+
+cubist_tuning_params_frequent <- function(x) {
+  tibble::tibble(
+    method = x$method[1],
+    committees = freq_highest(x$committees),
+    neighbors = freq_highest(x$neighbors),
+    rules = freq_highest(x$rules))
 }
